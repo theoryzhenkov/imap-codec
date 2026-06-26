@@ -544,7 +544,7 @@ mod tests {
             let mut data = [0u8; 256];
 
             // Randomize.
-            rng.fill_bytes(&mut data);
+            rng.try_fill(&mut data).unwrap();
             let mut unstructured = Unstructured::new(&data);
 
             let mut count = 0;
@@ -567,7 +567,7 @@ mod tests {
                     }
                     Err(Error::NotEnoughData | Error::IncorrectFormat) => {
                         // Randomize.
-                        rng.fill_bytes(&mut data);
+                        rng.try_fill(&mut data).unwrap();
                         unstructured = Unstructured::new(&data);
                     }
                     Err(Error::EmptyChoose) => {

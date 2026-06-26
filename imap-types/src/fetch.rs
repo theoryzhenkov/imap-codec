@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     body::BodyStructure,
-    core::{AString, NString, NString8, Vec1},
+    core::{AString, NString, NString8, Text, Vec1},
     datetime::DateTime,
     envelope::Envelope,
     flag::FlagFetch,
@@ -244,6 +244,15 @@ pub enum MessageDataItemName<'a> {
     #[cfg(feature = "ext_condstore_qresync")]
     #[cfg_attr(docsrs, doc(cfg("ext_condstore_qresync")))]
     ModSeq,
+
+    /// Gmail message ID (`X-GM-MSGID`).
+    GmailMessageId,
+
+    /// Gmail thread ID (`X-GM-THRID`).
+    GmailThreadId,
+
+    /// Gmail labels (`X-GM-LABELS`).
+    GmailLabels,
 }
 
 /// Message data item.
@@ -385,6 +394,15 @@ pub enum MessageDataItem<'a> {
     #[cfg(feature = "ext_condstore_qresync")]
     #[cfg_attr(docsrs, doc(cfg("ext_condstore_qresync")))]
     ModSeq(NonZeroU64),
+
+    /// Gmail message ID from `X-GM-MSGID`.
+    GmailMessageId(u64),
+
+    /// Gmail thread ID from `X-GM-THRID`.
+    GmailThreadId(u64),
+
+    /// Gmail labels from `X-GM-LABELS`.
+    GmailLabels(Vec<Text<'a>>),
 }
 
 /// A part specifier is either a part number or one of the following:

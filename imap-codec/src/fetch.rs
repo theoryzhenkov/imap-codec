@@ -2,7 +2,7 @@ use std::num::NonZeroU32;
 
 use abnf_core::streaming::sp;
 use imap_types::{
-    core::{AString, NString8, Vec1},
+    core::{AString, NString8, Text, Vec1},
     fetch::{MessageDataItem, MessageDataItemName, Part, PartSpecifier, Section},
 };
 use nom::{
@@ -18,7 +18,7 @@ use nom::{
 use crate::extensions::condstore_qresync::mod_sequence_value;
 use crate::{
     body::body,
-    core::{astring, nstring, number, nz_number},
+    core::{astring, atom, nstring, number, number64, nz_number},
     datetime::date_time,
     decode::IMAPResult,
     envelope::envelope,
@@ -115,6 +115,18 @@ pub(crate) fn fetch_att(input: &[u8]) -> IMAPResult<&[u8], MessageDataItemName> 
         value(MessageDataItemName::Rfc822, tag_no_case(b"RFC822")),
         #[cfg(feature = "ext_condstore_qresync")]
         value(MessageDataItemName::ModSeq, tag_no_case(b"MODSEQ")),
+        value(
+            MessageDataItemName::GmailMessageId,
+            tag_no_case(b"X-GM-MSGID"),
+        ),
+        value(
+            MessageDataItemName::GmailThreadId,
+            tag_no_case(b"X-GM-THRID"),
+        ),
+        value(
+            MessageDataItemName::GmailLabels,
+            tag_no_case(b"X-GM-LABELS"),
+        ),
     ))(input)
 }
 
@@ -147,6 +159,13 @@ pub(crate) fn msg_att_dynamic(input: &[u8]) -> IMAPResult<&[u8], MessageDataItem
         ),
         |flags| MessageDataItem::Flags(flags.unwrap_or_default()),
     );
+    let gmail_labels = map(
+        preceded(
+            tag_no_case(b"X-GM-LABELS "),
+            delimited(char('('), opt(separated_list1(sp, gmail_label)), char(')')),
+        ),
+        |labels| MessageDataItem::GmailLabels(labels.unwrap_or_default()),
+    );
     #[cfg(feature = "ext_condstore_qresync")]
     let modseq = map(
         preceded(
@@ -157,10 +176,10 @@ pub(crate) fn msg_att_dynamic(input: &[u8]) -> IMAPResult<&[u8], MessageDataItem
     );
 
     #[cfg(feature = "ext_condstore_qresync")]
-    let mut parser = alt((flags, modseq));
+    let mut parser = alt((flags, gmail_labels, modseq));
 
     #[cfg(not(feature = "ext_condstore_qresync"))]
-    let mut parser = flags;
+    let mut parser = alt((flags, gmail_labels));
 
     let (remaining, item) = parser(input)?;
 
@@ -233,6 +252,14 @@ pub(crate) fn msg_att_static(input: &[u8]) -> IMAPResult<&[u8], MessageDataItem>
             MessageDataItem::Uid,
         ),
         map(
+            preceded(tag_no_case(b"X-GM-MSGID "), number64),
+            MessageDataItem::GmailMessageId,
+        ),
+        map(
+            preceded(tag_no_case(b"X-GM-THRID "), number64),
+            MessageDataItem::GmailThreadId,
+        ),
+        map(
             tuple((
                 tag_no_case(b"BINARY"),
                 section_binary,
@@ -257,6 +284,17 @@ pub(crate) fn msg_att_static(input: &[u8]) -> IMAPResult<&[u8], MessageDataItem>
 /// Note: Strictly ascending
 pub(crate) fn uniqueid(input: &[u8]) -> IMAPResult<&[u8], NonZeroU32> {
     nz_number(input)
+}
+
+fn gmail_label(input: &[u8]) -> IMAPResult<&[u8], Text> {
+    alt((
+        map(preceded(char('\\'), atom), |label| {
+            Text::try_from(format!("\\{}", label.inner())).unwrap()
+        }),
+        map(astring, |label| {
+            Text::try_from(String::from_utf8(label.as_ref().to_vec()).unwrap()).unwrap()
+        }),
+    ))(input)
 }
 
 /// `section = "[" [section-spec] "]"`
@@ -353,13 +391,18 @@ pub(crate) fn header_fld_name(input: &[u8]) -> IMAPResult<&[u8], AString> {
 mod tests {
     use imap_types::{
         body::{BasicFields, Body, BodyStructure, SpecificFields},
-        core::{IString, NString},
+        command::{Command, CommandBody},
+        core::{IString, NString, Text},
         datetime::DateTime,
         envelope::Envelope,
+        response::{Data, Response},
     };
 
     use super::*;
-    use crate::testing::known_answer_test_encode;
+    use crate::{
+        CommandCodec, ResponseCodec, decode::Decoder, encode::Encoder,
+        testing::known_answer_test_encode,
+    };
 
     #[test]
     fn test_encode_message_data_item_name() {
@@ -387,6 +430,59 @@ mod tests {
         for test in tests {
             known_answer_test_encode(test);
         }
+    }
+
+    #[test]
+    fn encodes_gmail_fetch_item_names() {
+        let command = Command::new(
+            "A001",
+            CommandBody::fetch(
+                "1:*",
+                vec![
+                    MessageDataItemName::GmailMessageId,
+                    MessageDataItemName::GmailThreadId,
+                    MessageDataItemName::GmailLabels,
+                ],
+                true,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let bytes = CommandCodec::default().encode(&command).dump();
+
+        assert_eq!(
+            bytes,
+            b"A001 UID FETCH 1:* (X-GM-MSGID X-GM-THRID X-GM-LABELS)\r\n"
+        );
+    }
+
+    #[test]
+    fn parses_gmail_fetch_response_attributes() {
+        let (remainder, response) = ResponseCodec::default().decode(
+            b"* 23 FETCH (UID 7 X-GM-MSGID 1278455344230334865 X-GM-THRID 1266894439832287888 X-GM-LABELS (\\Inbox \"Project Alpha\" Important))\r\n",
+        )
+        .unwrap();
+        assert_eq!(remainder, b"");
+        let Response::Data(Data::Fetch { items, .. }) = response else {
+            panic!("expected FETCH response");
+        };
+
+        assert!(
+            items
+                .as_ref()
+                .contains(&MessageDataItem::GmailMessageId(1_278_455_344_230_334_865))
+        );
+        assert!(
+            items
+                .as_ref()
+                .contains(&MessageDataItem::GmailThreadId(1_266_894_439_832_287_888))
+        );
+        assert!(items.as_ref().contains(&MessageDataItem::GmailLabels(vec![
+            Text::try_from(r"\Inbox").unwrap(),
+            Text::try_from("Project Alpha").unwrap(),
+            Text::try_from("Important").unwrap(),
+        ])));
     }
 
     #[test]

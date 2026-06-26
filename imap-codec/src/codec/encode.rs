@@ -1129,6 +1129,9 @@ impl EncodeIntoContext for MessageDataItemName<'_> {
             Self::Rfc822Size => ctx.write_all(b"RFC822.SIZE"),
             Self::Rfc822Text => ctx.write_all(b"RFC822.TEXT"),
             Self::Uid => ctx.write_all(b"UID"),
+            Self::GmailMessageId => ctx.write_all(b"X-GM-MSGID"),
+            Self::GmailThreadId => ctx.write_all(b"X-GM-THRID"),
+            Self::GmailLabels => ctx.write_all(b"X-GM-LABELS"),
             MessageDataItemName::Binary {
                 section,
                 partial,
@@ -1764,6 +1767,13 @@ impl EncodeIntoContext for MessageDataItem<'_> {
                 nstring.encode_ctx(ctx)
             }
             Self::Uid(uid) => write!(ctx, "UID {uid}"),
+            Self::GmailMessageId(value) => write!(ctx, "X-GM-MSGID {value}"),
+            Self::GmailThreadId(value) => write!(ctx, "X-GM-THRID {value}"),
+            Self::GmailLabels(labels) => {
+                ctx.write_all(b"X-GM-LABELS (")?;
+                join_serializable(labels, b" ", ctx)?;
+                ctx.write_all(b")")
+            }
             Self::Binary { section, value } => {
                 ctx.write_all(b"BINARY[")?;
                 join_serializable(section, b".", ctx)?;

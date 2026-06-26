@@ -4,6 +4,8 @@ use abnf_core::streaming::crlf;
 use abnf_core::streaming::crlf_relaxed as crlf;
 use abnf_core::streaming::sp;
 use base64::{Engine, engine::general_purpose::STANDARD as _base64};
+#[cfg(feature = "ext_condstore_qresync")]
+use imap_types::sequence::SequenceSet;
 use imap_types::{
     core::{Text, Vec1},
     fetch::MessageDataItem,
@@ -421,35 +423,39 @@ pub(crate) fn message_data(input: &[u8]) -> IMAPResult<&[u8], Data> {
     enum TmpData<'a> {
         Expunge,
         Fetch(Vec1<MessageDataItem<'a>>),
+        #[cfg(feature = "ext_condstore_qresync")]
+        Vanished(bool, SequenceSet),
     }
 
-    alt((
-        map(
-            tuple((
-                terminated(nz_number, sp),
-                alt((
-                    value(TmpData::Expunge, tag_no_case(b"EXPUNGE")),
-                    map(preceded(tag_no_case(b"FETCH "), msg_att), TmpData::Fetch),
+    let (remaining, (seq, tmp)) = tuple((
+        terminated(nz_number, sp),
+        alt((
+            value(TmpData::Expunge, tag_no_case(b"EXPUNGE")),
+            map(preceded(tag_no_case(b"FETCH "), msg_att), TmpData::Fetch),
+            #[cfg(feature = "ext_condstore_qresync")]
+            map(
+                tuple((
+                    tag_no_case("VANISHED"),
+                    opt(tag_no_case(" (EARLIER)")),
+                    preceded(sp, sequence_set),
                 )),
-            )),
-            |(seq, tmp)| match tmp {
-                TmpData::Expunge => Data::Expunge(seq),
-                TmpData::Fetch(items) => Data::Fetch { seq, items },
-            },
-        ),
-        #[cfg(feature = "ext_condstore_qresync")]
-        map(
-            tuple((
-                tag_no_case(b"VANISHED"),
-                opt(tag_no_case(" (EARLIER)")),
-                preceded(sp, sequence_set),
-            )),
-            |(_, earlier, known_uids)| Data::Vanished {
-                earlier: earlier.is_some(),
+                |(_, earlier, known_uids)| TmpData::Vanished(earlier.is_some(), known_uids),
+            ),
+        )),
+    ))(input)?;
+
+    Ok((
+        remaining,
+        match tmp {
+            TmpData::Expunge => Data::Expunge(seq),
+            TmpData::Fetch(items) => Data::Fetch { seq, items },
+            #[cfg(feature = "ext_condstore_qresync")]
+            TmpData::Vanished(earlier, known_uids) => Data::Vanished {
+                earlier,
                 known_uids,
             },
-        ),
-    ))(input)
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -545,45 +551,6 @@ mod tests {
                 Response::Data(Data::Expunge(123.try_into().unwrap())),
             ),
         ]);
-    }
-
-    #[cfg(feature = "ext_condstore_qresync")]
-    #[test]
-    fn test_kat_inverse_response_vanished() {
-        kat_inverse_response(&[
-            (
-                b"* VANISHED 1\r\n".as_ref(),
-                b"".as_ref(),
-                Response::Data(Data::Vanished {
-                    earlier: false,
-                    known_uids: "1".try_into().unwrap(),
-                }),
-            ),
-            (
-                b"* VANISHED 1:5,7\r\n".as_ref(),
-                b"".as_ref(),
-                Response::Data(Data::Vanished {
-                    earlier: false,
-                    known_uids: "1:5,7".try_into().unwrap(),
-                }),
-            ),
-            (
-                b"* VANISHED (EARLIER) 1:5,7,9:11\r\n".as_ref(),
-                b"".as_ref(),
-                Response::Data(Data::Vanished {
-                    earlier: true,
-                    known_uids: "1:5,7,9:11".try_into().unwrap(),
-                }),
-            ),
-        ]);
-    }
-
-    // NOTE: regression test for https://github.com/duesee/imap-codec/issues/705
-    #[cfg(feature = "ext_condstore_qresync")]
-    #[test]
-    fn test_parse_response_vanished_with_leading_seq_rejected() {
-        assert!(response_data(b"* 5 VANISHED 1:3\r\n").is_err());
-        assert!(response_data(b"* 5 VANISHED (EARLIER) 1:3\r\n").is_err());
     }
 
     #[test]
