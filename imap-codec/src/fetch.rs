@@ -589,6 +589,18 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "ext_condstore_qresync")]
+    #[test]
+    fn test_encode_message_data_item_modseq_is_parenthesized() {
+        // RFC 7162: msg-att-dynamic =/ "MODSEQ" SP "(" permsg-modseq ")".
+        // The decoder expects the parenthesized form, so the encoder must match
+        // (otherwise encode->decode does not round-trip).
+        known_answer_test_encode((
+            MessageDataItem::ModSeq(std::num::NonZeroU64::try_from(320162350).unwrap()),
+            b"MODSEQ (320162350)".as_ref(),
+        ));
+    }
+
     #[test]
     fn test_encode_section() {
         let tests = [
