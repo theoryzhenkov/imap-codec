@@ -344,6 +344,8 @@ pub(crate) fn response_data(input: &[u8]) -> IMAPResult<&[u8], Response> {
                 Response::Status(Status::Bye(Bye { code, text }))
             }),
             map(mailbox_data, Response::Data),
+            #[cfg(feature = "ext_condstore_qresync")]
+            map(vanished, Response::Data),
             map(message_data, Response::Data),
             map(capability_data, |caps| {
                 Response::Data(Data::Capability(caps))
@@ -416,6 +418,27 @@ pub(crate) fn response_fatal(input: &[u8]) -> IMAPResult<&[u8], Status> {
 /// ```abnf
 /// message-data =/ expunged-resp
 ///
+/// `expunged-resp = "VANISHED" [SP "(EARLIER)"] SP known-uids`  (RFC 7162)
+///
+/// VANISHED is a `response-data` production in its own right: unlike the
+/// `EXPUNGE`/`FETCH` forms of `message-data`, it has NO leading `nz-number`.
+/// Real servers (e.g. Gmail) send `* VANISHED (EARLIER) <uids>`. (A leading
+/// number, as some lenient encoders emit, is still accepted via `message_data`.)
+#[cfg(feature = "ext_condstore_qresync")]
+pub(crate) fn vanished(input: &[u8]) -> IMAPResult<&[u8], Data> {
+    map(
+        tuple((
+            tag_no_case("VANISHED"),
+            opt(tag_no_case(" (EARLIER)")),
+            preceded(sp, sequence_set),
+        )),
+        |(_, earlier, known_uids)| Data::Vanished {
+            earlier: earlier.is_some(),
+            known_uids,
+        },
+    )(input)
+}
+
 /// expunged-resp = "VANISHED" [SP "(EARLIER)"] SP known-uids
 /// ```
 pub(crate) fn message_data(input: &[u8]) -> IMAPResult<&[u8], Data> {
@@ -809,5 +832,23 @@ mod tests {
 
         #[cfg(feature = "quirk_trailing_space_capability")]
         assert!(response_data(b"* CAPABILITY IMAP4REV1 \r\n").is_ok());
+    }
+
+    #[cfg(feature = "ext_condstore_qresync")]
+    #[test]
+    fn test_decode_vanished_without_leading_number() {
+        // RFC 7162: VANISHED is a `response-data` production with NO leading
+        // nz-number. Real servers (e.g. Gmail) send `* VANISHED (EARLIER) ...`.
+        let (rem, parsed) =
+            response_data(b"* VANISHED (EARLIER) 300:310,405,411\r\n").unwrap();
+        assert!(rem.is_empty());
+        match parsed {
+            Response::Data(Data::Vanished { earlier, .. }) => assert!(earlier),
+            other => panic!("expected VANISHED, got {other:?}"),
+        }
+        // Without EARLIER.
+        assert!(response_data(b"* VANISHED 405,411\r\n").is_ok());
+        // A leading number (lenient encoders) still parses via `message_data`.
+        assert!(response_data(b"* 1 VANISHED (EARLIER) 7:8\r\n").is_ok());
     }
 }
