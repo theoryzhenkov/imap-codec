@@ -1771,7 +1771,12 @@ impl EncodeIntoContext for MessageDataItem<'_> {
             Self::GmailThreadId(value) => write!(ctx, "X-GM-THRID {value}"),
             Self::GmailLabels(labels) => {
                 ctx.write_all(b"X-GM-LABELS (")?;
-                join_serializable(labels, b" ", ctx)?;
+                for (index, label) in labels.iter().enumerate() {
+                    if index > 0 {
+                        ctx.write_all(b" ")?;
+                    }
+                    encode_gmail_label(label, ctx)?;
+                }
                 ctx.write_all(b")")
             }
             Self::Binary { section, value } => {
@@ -2138,6 +2143,23 @@ pub(crate) mod utils {
             }
         }
     }
+}
+
+/// Encode one `X-GM-LABELS` member: `\`-prefixed system labels are atoms and
+/// written raw; user labels are quoted with `\` and `"` escaped. UTF-8 bytes
+/// pass through verbatim (Gmail transports labels as UTF-8).
+fn encode_gmail_label(label: &str, ctx: &mut EncodeContext) -> std::io::Result<()> {
+    if label.starts_with('\\') {
+        return ctx.write_all(label.as_bytes());
+    }
+    ctx.write_all(b"\"")?;
+    for byte in label.bytes() {
+        if byte == b'"' || byte == b'\\' {
+            ctx.write_all(&[b'\\'])?;
+        }
+        ctx.write_all(&[byte])?;
+    }
+    ctx.write_all(b"\"")
 }
 
 #[cfg(test)]

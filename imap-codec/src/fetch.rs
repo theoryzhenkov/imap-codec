@@ -1,16 +1,17 @@
+use std::borrow::Cow;
 use std::num::NonZeroU32;
 
 use abnf_core::streaming::sp;
 use imap_types::{
-    core::{AString, NString8, Text, Vec1},
+    core::{AString, NString8, Vec1},
     fetch::{MessageDataItem, MessageDataItemName, Part, PartSpecifier, Section},
 };
 use nom::{
     branch::alt,
-    bytes::streaming::{tag, tag_no_case},
+    bytes::streaming::{tag, tag_no_case, take_while1},
     character::streaming::char,
     combinator::{map, opt, value},
-    multi::separated_list1,
+    multi::{many0, separated_list1},
     sequence::{delimited, preceded, tuple},
 };
 
@@ -18,7 +19,7 @@ use nom::{
 use crate::extensions::condstore_qresync::mod_sequence_value;
 use crate::{
     body::body,
-    core::{astring, atom, nstring, number, number64, nz_number},
+    core::{astring, atom, literal, nstring, number, number64, nz_number},
     datetime::date_time,
     decode::IMAPResult,
     envelope::envelope,
@@ -286,15 +287,65 @@ pub(crate) fn uniqueid(input: &[u8]) -> IMAPResult<&[u8], NonZeroU32> {
     nz_number(input)
 }
 
-fn gmail_label(input: &[u8]) -> IMAPResult<&[u8], Text> {
+/// A single `X-GM-LABELS` list member.
+///
+/// Gmail user labels are user-authored Unicode; the standard `astring`
+/// grammar is 7-bit in its quoted form and the previous implementation
+/// funneled every label through `Text::try_from(...).unwrap()` (also 7-bit).
+/// Net effect over server-controlled bytes: a non-ASCII atom label panicked
+/// the whole FETCH parse, and a quoted UTF-8 label failed the response
+/// outright. Labels are decoded here with dedicated, byte-permissive
+/// branches — quoted (with `\"`/`\\` escapes), literal, `\`-prefixed system
+/// atoms, and bare atoms — and any invalid UTF-8 is decoded lossily. A label
+/// never panics and is never dropped.
+fn gmail_label(input: &[u8]) -> IMAPResult<&[u8], Cow<str>> {
     alt((
         map(preceded(char('\\'), atom), |label| {
-            Text::try_from(format!("\\{}", label.inner())).unwrap()
+            Cow::Owned(format!("\\{}", label.inner()))
         }),
-        map(astring, |label| {
-            Text::try_from(String::from_utf8(label.as_ref().to_vec()).unwrap()).unwrap()
+        gmail_label_quoted,
+        map(literal, |label| {
+            Cow::Owned(String::from_utf8_lossy(label.as_ref()).into_owned())
+        }),
+        map(take_while1(is_gmail_label_atom_byte), |label: &[u8]| {
+            String::from_utf8_lossy(label)
         }),
     ))(input)
+}
+
+/// A quoted Gmail label: like an IMAP quoted string, but 8-bit tolerant so a
+/// UTF-8 label (which Gmail sends verbatim) survives. `\"` and `\\` escapes
+/// are honored; CR/LF/NUL still terminate the token.
+fn gmail_label_quoted(input: &[u8]) -> IMAPResult<&[u8], Cow<str>> {
+    map(
+        delimited(
+            char('"'),
+            many0(alt((
+                map(preceded(char('\\'), nom::character::streaming::one_of("\\\"")), |escaped| {
+                    escaped as u8
+                }),
+                nom::combinator::map_opt(
+                    nom::number::streaming::u8,
+                    |byte| match byte {
+                        b'"' | b'\\' | b'\r' | b'\n' | 0 => None,
+                        other => Some(other),
+                    },
+                ),
+            ))),
+            char('"'),
+        ),
+        |bytes: Vec<u8>| Cow::Owned(String::from_utf8_lossy(&bytes).into_owned()),
+    )(input)
+}
+
+/// Bytes allowed in a bare (unquoted, non-system) Gmail label token: anything
+/// that does not delimit the surrounding list or start another IMAP token.
+/// Deliberately 8-bit tolerant (unlike `ATOM-CHAR`).
+fn is_gmail_label_atom_byte(byte: u8) -> bool {
+    !matches!(
+        byte,
+        0x00..=0x1f | 0x7f | b' ' | b'(' | b')' | b'{' | b'%' | b'*' | b'"' | b'\\'
+    )
 }
 
 /// `section = "[" [section-spec] "]"`
@@ -392,7 +443,7 @@ mod tests {
     use imap_types::{
         body::{BasicFields, Body, BodyStructure, SpecificFields},
         command::{Command, CommandBody},
-        core::{IString, NString, Text},
+        core::{IString, NString},
         datetime::DateTime,
         envelope::Envelope,
         response::{Data, Response},
@@ -479,10 +530,72 @@ mod tests {
                 .contains(&MessageDataItem::GmailThreadId(1_266_894_439_832_287_888))
         );
         assert!(items.as_ref().contains(&MessageDataItem::GmailLabels(vec![
-            Text::try_from(r"\Inbox").unwrap(),
-            Text::try_from("Project Alpha").unwrap(),
-            Text::try_from("Important").unwrap(),
+            Cow::Borrowed(r"\Inbox"),
+            Cow::Borrowed("Project Alpha"),
+            Cow::Borrowed("Important"),
         ])));
+    }
+
+    /// Regression: Gmail user labels are user-authored Unicode. The previous
+    /// parser funneled labels through `Text::try_from(...).unwrap()` (7-bit),
+    /// so a bare non-ASCII label panicked the whole FETCH parse and a quoted
+    /// UTF-8 label failed the response outright. Both must round-trip.
+    #[test]
+    fn parses_non_ascii_gmail_labels_without_panicking() {
+        let wire = "* 5 FETCH (UID 9 X-GM-LABELS (\\Inbox Résumés \"酒店 ✈️\" \"quote\\\"inside\"))\r\n";
+        let (remainder, response) = ResponseCodec::default().decode(wire.as_bytes()).unwrap();
+        assert_eq!(remainder, b"");
+        let Response::Data(Data::Fetch { items, .. }) = response else {
+            panic!("expected FETCH response");
+        };
+
+        assert!(items.as_ref().contains(&MessageDataItem::GmailLabels(vec![
+            Cow::Borrowed(r"\Inbox"),
+            Cow::Borrowed("Résumés"),
+            Cow::Borrowed("酒店 ✈️"),
+            Cow::Borrowed("quote\"inside"),
+        ])));
+    }
+
+    /// Server-controlled bytes that are not valid UTF-8 must never panic or
+    /// drop the label: they are decoded lossily (U+FFFD) instead.
+    #[test]
+    fn invalid_utf8_gmail_label_is_decoded_lossily_not_dropped() {
+        let mut wire: Vec<u8> = b"* 5 FETCH (UID 9 X-GM-LABELS (bad".to_vec();
+        wire.extend_from_slice(&[0xff, 0xfe]);
+        wire.extend_from_slice(b"label))\r\n");
+
+        let (remainder, response) = ResponseCodec::default().decode(&wire).unwrap();
+        assert_eq!(remainder, b"");
+        let Response::Data(Data::Fetch { items, .. }) = response else {
+            panic!("expected FETCH response");
+        };
+
+        assert!(items.as_ref().contains(&MessageDataItem::GmailLabels(vec![
+            Cow::Borrowed("bad\u{fffd}\u{fffd}label"),
+        ])));
+    }
+
+    /// Encoder side of the carrier change: system labels stay bare atoms;
+    /// user labels (including UTF-8) are quoted with `\` and `"` escaped.
+    #[test]
+    fn encodes_gmail_labels_with_quoting_and_escapes() {
+        let response = Response::Data(Data::Fetch {
+            seq: NonZeroU32::new(5).unwrap(),
+            items: Vec1::try_from(vec![MessageDataItem::GmailLabels(vec![
+                Cow::Borrowed(r"\Starred"),
+                Cow::Borrowed("Résumés"),
+                Cow::Borrowed("quote\"inside"),
+            ])])
+            .unwrap(),
+        });
+
+        let bytes = ResponseCodec::default().encode(&response).dump();
+
+        assert_eq!(
+            bytes,
+            "* 5 FETCH (X-GM-LABELS (\\Starred \"Résumés\" \"quote\\\"inside\"))\r\n".as_bytes()
+        );
     }
 
     #[test]

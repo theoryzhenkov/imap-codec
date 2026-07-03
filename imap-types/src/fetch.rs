@@ -3,6 +3,7 @@
 #[cfg(feature = "ext_condstore_qresync")]
 use std::num::NonZeroU64;
 use std::{
+    borrow::Cow,
     fmt::{Display, Formatter},
     num::NonZeroU32,
 };
@@ -15,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     body::BodyStructure,
-    core::{AString, NString, NString8, Text, Vec1},
+    core::{AString, NString, NString8, Vec1},
     datetime::DateTime,
     envelope::Envelope,
     flag::FlagFetch,
@@ -402,7 +403,12 @@ pub enum MessageDataItem<'a> {
     GmailThreadId(u64),
 
     /// Gmail labels from `X-GM-LABELS`.
-    GmailLabels(Vec<Text<'a>>),
+    ///
+    /// Carried as UTF-8 text rather than an IMAP `Text` (7-bit) because Gmail
+    /// user labels are user-authored Unicode (accented, CJK, emoji, ...). A
+    /// server-supplied label must never fail to parse or be dropped: invalid
+    /// UTF-8 is decoded lossily at the parser boundary.
+    GmailLabels(Vec<Cow<'a, str>>),
 }
 
 /// A part specifier is either a part number or one of the following:
